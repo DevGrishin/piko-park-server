@@ -1,87 +1,75 @@
-// Simple TCP relay server: newline-delimited JSON messages
-// Run: node server.js
-const net = require('net');
+const WebSocket = require('ws');
 
-const PORT = 3000;
-let nextId = 1;
-const clients = new Map(); // id -> { socket, buffer }
+const PORT = process.env.PORT || 8080;
+const wss = new WebSocket.Server({ port: PORT });
 
-function sendJson(socket, obj) {
-    try {
-        socket.write(JSON.stringify(obj) + '\n');
-    } catch (e) {
-        // ignore
+const clients = new Map(); // id -> { ws, lastSeen, state }
+
+function makeId() {
+    return Date.now().toString(36) + '-' + Math.floor(Math.random() * 1e6).toString(36);
+}
+
+function broadcast(obj, exceptId) {
+    const raw = JSON.stringify(obj);
+    for (const [pid, c] of clients) {
+        if (pid === exceptId) continue;
+        if (c.ws.readyState === WebSocket.OPEN) c.ws.send(raw);
     }
 }
 
-const server = net.createServer((socket) => {
-    const id = String(nextId++);
-    clients.set(id, { socket, buffer: '' });
+wss.on('connection', (ws) => {
+    const id = makeId();
+    clients.set(id, { ws, lastSeen: Date.now(), state: null });
 
-    // tell client its assigned id
-    sendJson(socket, { type: 'welcome', id });
-
-    // announce new player to others
-    for (const [otherId, c] of clients) {
-        if (otherId === id) continue;
-        sendJson(c.socket, { type: 'join', id });
+    // send initial data (assigned id + known players)
+    const players = {};
+    for (const [pid, c] of clients) {
+        if (c.state) players[pid] = c.state;
     }
+    ws.send(JSON.stringify({ type: 'init', id, players }));
 
-    socket.on('data', (raw) => {
-        const state = clients.get(id);
-        if (!state) return;
-        state.buffer += raw.toString('utf8');
+    // notify others that a new player joined
+    broadcast({ type: 'player_join', id }, id);
 
-        // split by newline to support message framing
-        let idx;
-        while ((idx = state.buffer.indexOf('\n')) >= 0) {
-            const line = state.buffer.slice(0, idx).trim();
-            state.buffer = state.buffer.slice(idx + 1);
-            if (line.length === 0) continue;
+    ws.on('message', (raw) => {
+        let msg;
+        try { msg = JSON.parse(raw); } catch (e) { return; }
 
-            let msg;
-            try {
-                msg = JSON.parse(line);
-            } catch (e) {
-                // ignore bad JSON
-                continue;
-            }
-
-            // Expect messages like:
-            // { type: "update", pos: {x:.., y:..}, vel: {x:.., y:..} }
-            if (msg.type === 'update') {
-                // include sender id and broadcast to all OTHER clients
-                const out = {
-                    type: 'update',
-                    id,
-                    pos: msg.pos,
-                    vel: msg.vel,
-                    ts: Date.now()
-                };
-                for (const [otherId, c] of clients) {
-                    if (otherId === id) continue;
-                    sendJson(c.socket, out);
-                }
-            } else if (msg.type === 'ping') {
-                sendJson(socket, { type: 'pong', ts: Date.now() });
-            }
-            // add other message types as needed
+        if (msg.type === 'update') {
+            // Expect: { type: 'update', x: Number, y: Number, vx: Number, vy: Number }
+            const state = { x: +msg.x, y: +msg.y, vx: +msg.vx, vy: +msg.vy, ts: Date.now() };
+            const c = clients.get(id);
+            if (c) { c.state = state; c.lastSeen = Date.now(); }
+            // broadcast to everyone else
+            broadcast({ type: 'player_update', id, ...state }, id);
+        } else if (msg.type === 'ping' || msg.type === 'pong') {
+            const c = clients.get(id);
+            if (c) c.lastSeen = Date.now();
+        } else if (msg.type === 'leave') {
+            ws.close();
         }
     });
 
-    socket.on('close', () => {
+    ws.on('close', () => {
         clients.delete(id);
-        // inform remaining clients
-        for (const [, c] of clients) {
-            sendJson(c.socket, { type: 'leave', id });
+        broadcast({ type: 'player_leave', id });
+    });
+
+    ws.on('error', () => {
+        // ignore per-connection errors
+    });
+});
+
+// cleanup stale clients that stopped sending updates
+setInterval(() => {
+    const now = Date.now();
+    for (const [pid, c] of clients) {
+        if (now - c.lastSeen > 30_000) { // 30 sec timeout
+            try { c.ws.terminate(); } catch (e) {}
+            clients.delete(pid);
+            broadcast({ type: 'player_leave', id: pid });
         }
-    });
+    }
+}, 5000);
 
-    socket.on('error', (err) => {
-        // client errors are ignored; close will follow
-    });
-});
-
-server.listen(PORT, () => {
-    console.log(`Relay server listening on 0.0.0.0:${PORT}`);
-});
+console.log(`WebSocket server listening on port ${PORT}`);
