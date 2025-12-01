@@ -1,13 +1,34 @@
-const WebSocket = require('ws');
+const express = require('express');
+const { WebSocketServer } = require('ws');
+const http = require('http');
 
+const app = express();
 const PORT = process.env.PORT || 3000;
-const wss = new WebSocket.Server({ port: PORT });
+
+// Create HTTP server
+const server = http.createServer(app);
+
+// Create WebSocket server attached to HTTP server
+const wss = new WebSocketServer({ server });
 
 // Track connected players
 const players = new Map(); // playerId -> WebSocket connection
 let nextPlayerId = 1;
 
-console.log(`WebSocket server running on ws://localhost:${PORT}`);
+// Basic HTTP endpoint for health checks
+app.get('/', (req, res) => {
+    res.json({ 
+        status: 'running',
+        players: players.size,
+        message: 'Pico Park WebSocket Server'
+    });
+});
+
+app.get('/health', (req, res) => {
+    res.json({ status: 'ok', players: players.size });
+});
+
+console.log(`Server starting on port ${PORT}...`);
 
 wss.on('connection', (ws) => {
     // Assign unique player ID
@@ -40,7 +61,7 @@ wss.on('connection', (ws) => {
                 
                 // Send to all players except the sender
                 players.forEach((clientWs, clientId) => {
-                    if (clientWs !== ws && clientWs.readyState === WebSocket.OPEN) {
+                    if (clientWs !== ws && clientWs.readyState === 1) { // 1 = OPEN
                         clientWs.send(updateMsg);
                     }
                 });
@@ -62,7 +83,7 @@ wss.on('connection', (ws) => {
         });
         
         players.forEach((clientWs) => {
-            if (clientWs.readyState === WebSocket.OPEN) {
+            if (clientWs.readyState === 1) { // 1 = OPEN
                 clientWs.send(disconnectMsg);
             }
         });
@@ -74,13 +95,19 @@ wss.on('connection', (ws) => {
 });
 
 wss.on('error', (error) => {
-    console.error('Server error:', error);
+    console.error('WebSocket server error:', error);
+});
+
+// Start server
+server.listen(PORT, () => {
+    console.log(`HTTP server running on http://localhost:${PORT}`);
+    console.log(`WebSocket server running on ws://localhost:${PORT}`);
 });
 
 // Graceful shutdown
 process.on('SIGINT', () => {
     console.log('\nShutting down server...');
-    wss.close(() => {
+    server.close(() => {
         console.log('Server closed');
         process.exit(0);
     });
