@@ -9,7 +9,7 @@ const PORT = process.env.PORT || 3000;
 const server = http.createServer(app);
 
 // Create WebSocket server attached to HTTP server
-const wss = new WebSocketServer({ server });
+const wss = new WebSocketServer({ server, path: '/ws' });
 
 // Track connected players
 const players = new Map(); // playerId -> WebSocket connection
