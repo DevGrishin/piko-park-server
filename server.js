@@ -1,75 +1,87 @@
 const WebSocket = require('ws');
 
-const PORT = process.env.PORT || 8080;
+const PORT = 3000;
 const wss = new WebSocket.Server({ port: PORT });
 
-const clients = new Map(); // id -> { ws, lastSeen, state }
+// Track connected players
+const players = new Map(); // playerId -> WebSocket connection
+let nextPlayerId = 1;
 
-function makeId() {
-    return Date.now().toString(36) + '-' + Math.floor(Math.random() * 1e6).toString(36);
-}
-
-function broadcast(obj, exceptId) {
-    const raw = JSON.stringify(obj);
-    for (const [pid, c] of clients) {
-        if (pid === exceptId) continue;
-        if (c.ws.readyState === WebSocket.OPEN) c.ws.send(raw);
-    }
-}
+console.log(`WebSocket server running on ws://localhost:${PORT}`);
 
 wss.on('connection', (ws) => {
-    const id = makeId();
-    clients.set(id, { ws, lastSeen: Date.now(), state: null });
-
-    // send initial data (assigned id + known players)
-    const players = {};
-    for (const [pid, c] of clients) {
-        if (c.state) players[pid] = c.state;
-    }
-    ws.send(JSON.stringify({ type: 'init', id, players }));
-
-    // notify others that a new player joined
-    broadcast({ type: 'player_join', id }, id);
-
-    ws.on('message', (raw) => {
-        let msg;
-        try { msg = JSON.parse(raw); } catch (e) { return; }
-
-        if (msg.type === 'update') {
-            // Expect: { type: 'update', x: Number, y: Number, vx: Number, vy: Number }
-            const state = { x: +msg.x, y: +msg.y, vx: +msg.vx, vy: +msg.vy, ts: Date.now() };
-            const c = clients.get(id);
-            if (c) { c.state = state; c.lastSeen = Date.now(); }
-            // broadcast to everyone else
-            broadcast({ type: 'player_update', id, ...state }, id);
-        } else if (msg.type === 'ping' || msg.type === 'pong') {
-            const c = clients.get(id);
-            if (c) c.lastSeen = Date.now();
-        } else if (msg.type === 'leave') {
-            ws.close();
+    // Assign unique player ID
+    const playerId = `player_${nextPlayerId++}`;
+    players.set(playerId, ws);
+    
+    console.log(`Player connected: ${playerId} (${players.size} total)`);
+    
+    // Send welcome message with player ID
+    ws.send(JSON.stringify({
+        type: 'welcome',
+        playerId: playerId
+    }));
+    
+    // Handle incoming messages
+    ws.on('message', (message) => {
+        try {
+            const data = JSON.parse(message.toString());
+            
+            if (data.type === 'playerUpdate') {
+                // Broadcast player update to all other players
+                const updateMsg = JSON.stringify({
+                    type: 'playerUpdate',
+                    playerId: data.playerId,
+                    x: data.x,
+                    y: data.y,
+                    vx: data.vx,
+                    vy: data.vy
+                });
+                
+                // Send to all players except the sender
+                players.forEach((clientWs, clientId) => {
+                    if (clientWs !== ws && clientWs.readyState === WebSocket.OPEN) {
+                        clientWs.send(updateMsg);
+                    }
+                });
+            }
+        } catch (error) {
+            console.error('Error parsing message:', error);
         }
     });
-
+    
+    // Handle disconnection
     ws.on('close', () => {
-        clients.delete(id);
-        broadcast({ type: 'player_leave', id });
+        console.log(`Player disconnected: ${playerId} (${players.size - 1} remaining)`);
+        players.delete(playerId);
+        
+        // Notify other players about disconnection
+        const disconnectMsg = JSON.stringify({
+            type: 'playerDisconnected',
+            playerId: playerId
+        });
+        
+        players.forEach((clientWs) => {
+            if (clientWs.readyState === WebSocket.OPEN) {
+                clientWs.send(disconnectMsg);
+            }
+        });
     });
-
-    ws.on('error', () => {
-        // ignore per-connection errors
+    
+    ws.on('error', (error) => {
+        console.error(`WebSocket error for ${playerId}:`, error);
     });
 });
 
-// cleanup stale clients that stopped sending updates
-setInterval(() => {
-    const now = Date.now();
-    for (const [pid, c] of clients) {
-        if (now - c.lastSeen > 30_000) { // 30 sec timeout
-            try { c.ws.terminate(); } catch (e) {}
-            clients.delete(pid);
-            broadcast({ type: 'player_leave', id: pid });
-        }
-    }
-}, 5000);
+wss.on('error', (error) => {
+    console.error('Server error:', error);
+});
 
-console.log(`WebSocket server listening on port ${PORT}`);
+// Graceful shutdown
+process.on('SIGINT', () => {
+    console.log('\nShutting down server...');
+    wss.close(() => {
+        console.log('Server closed');
+        process.exit(0);
+    });
+});
